@@ -8,8 +8,10 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
+    "@supabase/supabase-js": "^2.45.4",
     "express": "^4.19.2",
     "qrcode": "^1.5.3",
-    "pino": "^9.3.2"
+    "pino": "^9.3.2",
+    "cors": "^2.8.5"
   }
 }
