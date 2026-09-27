@@ -14,6 +14,26 @@ app.use(express.json());
 
 const sessions = {}; // sessionId -> { sock, qr, status }
 
+// ---- Webhook helper: forwards data to the Lovable inbox endpoint ----
+async function sendToInbox(payload) {
+  try {
+    const res = await fetch(process.env.WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": process.env.WEBHOOK_SECRET,
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      console.error("Webhook failed:", res.status, await res.text());
+    }
+  } catch (err) {
+    console.error("Webhook error:", err.message);
+  }
+}
+
+// ---- Start (or resume) a session for a given sessionId ----
 async function startSession(sessionId) {
   const { state, saveCreds } = await useMultiFileAuthState(
     `/data/auth_info/${sessionId}`
@@ -28,6 +48,7 @@ async function startSession(sessionId) {
 
   sock.ev.on("creds.update", saveCreds);
 
+  // ---- Connection state changes ----
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
     const entry = sessions[sessionId];
@@ -53,19 +74,71 @@ async function startSession(sessionId) {
     }
   });
 
+  // ---- Real-time incoming messages ----
   sock.ev.on("messages.upsert", ({ messages }) => {
     for (const msg of messages) {
       if (!msg.key.fromMe) {
-        const sender = msg.key.remoteJid;
+        const sender = msg.key.remoteJid?.replace("@s.whatsapp.net", "");
+        if (!sender || msg.key.remoteJid?.includes("@g.us")) continue; // skip groups
+
         const text =
           msg.message?.conversation ||
           msg.message?.extendedTextMessage?.text ||
           null;
-        console.log(`[${sessionId}] incoming from ${sender}: ${text}`);
+        if (!text) continue;
+
+        sendToInbox({
+          sessionId,
+          type: "incoming_message",
+          conversation: {
+            contactNumber: sender,
+            contactName: msg.pushName || null,
+          },
+          message: {
+            direction: "incoming",
+            text,
+            timestamp: Math.floor(Date.now() / 1000),
+          },
+        });
       }
     }
   });
+
+  // ---- Initial history sync (fires once on first connect) ----
+  sock.ev.on("messaging-history.set", ({ messages }) => {
+    const grouped = {};
+
+    for (const msg of messages) {
+      const jid = msg.key.remoteJid;
+      if (!jid || jid.includes("@g.us")) continue; // skip group chats
+
+      const number = jid.replace("@s.whatsapp.net", "");
+      const text =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        null;
+      if (!text) continue;
+
+      if (!grouped[number]) grouped[number] = [];
+      grouped[number].push({
+        direction: msg.key.fromMe ? "outgoing" : "incoming",
+        text,
+        timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000),
+      });
+    }
+
+    for (const [number, msgs] of Object.entries(grouped)) {
+      sendToInbox({
+        sessionId,
+        type: "history_sync",
+        conversation: { contactNumber: number, contactName: null },
+        messages: msgs,
+      });
+    }
+  });
 }
+
+// ---- Routes ----
 
 app.post("/session/start", async (req, res) => {
   const { sessionId } = req.body;
@@ -96,6 +169,7 @@ app.get("/session/status", (req, res) => {
   res.json({ status: entry?.status || "disconnected" });
 });
 
+// ---- Send a message (also forwards it to the inbox as an outgoing message) ----
 app.post("/send", async (req, res) => {
   const { sessionId, number, message } = req.body;
   const entry = sessions[sessionId];
@@ -106,7 +180,24 @@ app.post("/send", async (req, res) => {
     const jid = number.includes("@s.whatsapp.net")
       ? number
       : `${number}@s.whatsapp.net`;
+
     await entry.sock.sendMessage(jid, { text: message });
+
+    // Forward this outgoing message to the inbox so it shows in the thread
+    sendToInbox({
+      sessionId,
+      type: "incoming_message", // reuse the same handler; direction marks it outgoing
+      conversation: {
+        contactNumber: number.replace("@s.whatsapp.net", ""),
+        contactName: null,
+      },
+      message: {
+        direction: "outgoing",
+        text: message,
+        timestamp: Math.floor(Date.now() / 1000),
+      },
+    });
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
