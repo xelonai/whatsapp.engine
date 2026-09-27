@@ -18,6 +18,61 @@ const AUTH_ROOT = process.env.AUTH_ROOT || path.join(process.cwd(), "auth_info")
 const sessions = new Map();
 const contactNames = new Map();
 
+// ---- Per-number chat & contact store (saved to disk so Sync works after restarts) ----
+const stores = new Map();
+const MAX_PER_CHAT = 300;
+function storePath(sid) { return path.join(AUTH_ROOT, sid, "store.json"); }
+function getStore(sid) {
+  let st = stores.get(sid);
+  if (st) return st;
+  st = { chats: {}, contacts: {}, timer: null };
+  try {
+    const raw = JSON.parse(fs.readFileSync(storePath(sid), "utf8"));
+    st.chats = raw.chats || {};
+    st.contacts = raw.contacts || {};
+  } catch {}
+  stores.set(sid, st);
+  return st;
+}
+function saveStore(sid) {
+  const st = getStore(sid);
+  if (st.timer) return;
+  st.timer = setTimeout(() => {
+    st.timer = null;
+    try {
+      fs.mkdirSync(path.join(AUTH_ROOT, sid), { recursive: true });
+      fs.writeFileSync(storePath(sid), JSON.stringify({ chats: st.chats, contacts: st.contacts }));
+    } catch (e) { console.error(`Store save failed: ${sid}: ${e.message}`); }
+  }, 2000);
+}
+function storeMessage(sid, raw) {
+  const jid = keyJid(raw?.key);
+  if (!jid || !raw?.message) return;
+  const text = messageText(raw.message);
+  if (!text) return;
+  const st = getStore(sid);
+  const chat = st.chats[jid] || (st.chats[jid] = { id: jid, name: null, messages: [] });
+  if (raw.pushName && !raw.key.fromMe) chat.name = chat.name || raw.pushName;
+  const id = raw.key.id || null;
+  if (id && chat.messages.some((m) => m.id === id)) return;
+  chat.messages.push({ id, fromMe: !!raw.key.fromMe, text, timestamp: unixSeconds(raw.messageTimestamp) });
+  if (chat.messages.length > MAX_PER_CHAT) {
+    chat.messages.sort((a, b) => a.timestamp - b.timestamp);
+    chat.messages = chat.messages.slice(-MAX_PER_CHAT);
+  }
+  saveStore(sid);
+}
+function storeContact(sid, c) {
+  const jid = cleanJid(c?.id) || cleanJid(c?.phoneNumber) || cleanJid(c?.jid);
+  if (!jid) return;
+  const name = c.name || c.notify || c.verifiedName || null;
+  const st = getStore(sid);
+  const prev = st.contacts[jid];
+  st.contacts[jid] = { id: jid, name: name || prev?.name || null };
+  if (name) contactNames.set(`${sid}:${jid}`, name);
+  saveStore(sid);
+}
+
 function validSessionId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(value);
 }
@@ -167,13 +222,17 @@ async function startSession(sessionId) {
   session.starting = false;
 
   socket.ev.on("creds.update", saveCreds);
+  socket.ev.on("contacts.update", (contacts) => { for (const c of contacts || []) storeContact(sessionId, c); });
   socket.ev.on("contacts.upsert", (contacts) => {
+    for (const c of contacts || []) storeContact(sessionId, c);
     for (const contact of contacts || []) {
       const jid = cleanJid(contact.id) || cleanJid(contact.phoneNumber) || cleanJid(contact.jid);
       if (jid) contactNames.set(`${sessionId}:${jid}`, contact.name || contact.notify || contact.verifiedName || null);
     }
   });
   socket.ev.on("messaging-history.set", ({ contacts, messages }) => {
+    for (const c of contacts || []) storeContact(sessionId, c);
+    for (const m of messages || []) storeMessage(sessionId, m);
     for (const contact of contacts || []) {
       const jid = cleanJid(contact.id) || cleanJid(contact.phoneNumber) || cleanJid(contact.jid);
       if (jid) contactNames.set(`${sessionId}:${jid}`, contact.name || contact.notify || contact.verifiedName || null);
@@ -182,6 +241,7 @@ async function startSession(sessionId) {
   });
   socket.ev.on("messages.upsert", ({ messages, type }) => {
     for (const message of messages || []) {
+      storeMessage(sessionId, message);
       console.log(`Message event (${type}) session=${sessionId} jid=${message?.key?.remoteJid}`);
       pushMessage(sessionId, message, type === "notify" ? "incoming_message" : "history_sync");
     }
@@ -250,6 +310,24 @@ app.post("/send", async (req, res) => {
     console.error(`Send failed: ${sessionId}: ${error.message}`);
     return res.status(500).json({ error: error.message });
   }
+});
+
+app.get("/session/chats", (req, res) => {
+  const { sessionId } = req.query;
+  if (!validSessionId(sessionId)) return res.status(400).json({ error: "A valid sessionId is required" });
+  const st = getStore(sessionId);
+  const chats = Object.values(st.chats).map((c) => ({
+    id: c.id,
+    name: c.name || st.contacts[c.id]?.name || null,
+    messages: [...c.messages].sort((a, b) => a.timestamp - b.timestamp),
+  }));
+  return res.json({ chats });
+});
+
+app.get("/session/contacts", (req, res) => {
+  const { sessionId } = req.query;
+  if (!validSessionId(sessionId)) return res.status(400).json({ error: "A valid sessionId is required" });
+  return res.json({ contacts: Object.values(getStore(sessionId).contacts) });
 });
 
 app.get("/health", (_req, res) => res.json({ ok: true, sessions: sessions.size }));
