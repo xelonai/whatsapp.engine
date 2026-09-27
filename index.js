@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
 const pino = require("pino");
+const path = require("path");
+const fs = require("fs");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -10,199 +12,235 @@ const {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-const sessions = {}; // sessionId -> { sock, qr, status }
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "https://broadwave.cloud/api/public/inbound";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || process.env.ENGINE_WEBHOOK_SECRET;
+const AUTH_ROOT = process.env.AUTH_ROOT || path.join(process.cwd(), "auth_info");
+const sessions = new Map();
+const contactNames = new Map();
 
-// ---- Webhook helper: forwards data to the Lovable inbox endpoint ----
-async function sendToInbox(payload) {
-  try {
-    const res = await fetch(process.env.WEBHOOK_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": process.env.WEBHOOK_SECRET,
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      console.error("Webhook failed:", res.status, await res.text());
-    }
-  } catch (err) {
-    console.error("Webhook error:", err.message);
-  }
+function validSessionId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(value);
 }
 
-// ---- Start (or resume) a session for a given sessionId ----
-async function startSession(sessionId) {
-  const { state, saveCreds } = await useMultiFileAuthState(
-    `/data/auth_info/${sessionId}`
+function cleanJid(jid) {
+  if (typeof jid !== "string") return null;
+  const normalized = jid.replace(/:\d+@/, "@");
+  if (!normalized.endsWith("@s.whatsapp.net") || normalized.includes("status@broadcast")) return null;
+  return normalized;
+}
+
+function unixSeconds(value) {
+  if (typeof value === "number") return Math.floor(value);
+  if (typeof value === "bigint") return Number(value);
+  if (value && typeof value.toNumber === "function") return value.toNumber();
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.floor(parsed) : Math.floor(Date.now() / 1000);
+}
+
+function messageText(message) {
+  if (!message) return "";
+  const content = message.ephemeralMessage?.message || message.viewOnceMessage?.message || message;
+  return (
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
+    content.documentMessage?.caption ||
+    ""
   );
+}
 
-  const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "silent" }),
-  });
+async function postWebhook(payload) {
+  if (!WEBHOOK_SECRET) {
+    console.error("Webhook error: WEBHOOK_SECRET is not configured");
+    return false;
+  }
 
-  sessions[sessionId] = { sock, qr: null, status: "connecting" };
-
-  sock.ev.on("creds.update", saveCreds);
-
-  // ---- Connection state changes ----
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    const entry = sessions[sessionId];
-    if (!entry) return;
-
-    if (qr) {
-      entry.qr = qr;
-      entry.status = "qr_ready";
-    }
-
-    if (connection === "open") {
-      entry.status = "connected";
-      entry.qr = null;
-      console.log(`[${sessionId}] connected`);
-    }
-
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      entry.status = "disconnected";
-      console.log(`[${sessionId}] closed, reconnect:`, shouldReconnect);
-      if (shouldReconnect) startSession(sessionId);
-    }
-  });
-
-  // ---- Real-time incoming messages ----
-  sock.ev.on("messages.upsert", ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.key.fromMe) {
-        const sender = msg.key.remoteJid?.replace("@s.whatsapp.net", "");
-        if (!sender || msg.key.remoteJid?.includes("@g.us")) continue; // skip groups
-
-        const text =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          null;
-        if (!text) continue;
-
-        sendToInbox({
-          sessionId,
-          type: "incoming_message",
-          conversation: {
-            contactNumber: sender,
-            contactName: msg.pushName || null,
-          },
-          message: {
-            direction: "incoming",
-            text,
-            timestamp: Math.floor(Date.now() / 1000),
-          },
-        });
-      }
-    }
-  });
-
-  // ---- Initial history sync (fires once on first connect) ----
-  sock.ev.on("messaging-history.set", ({ messages }) => {
-    const grouped = {};
-
-    for (const msg of messages) {
-      const jid = msg.key.remoteJid;
-      if (!jid || jid.includes("@g.us")) continue; // skip group chats
-
-      const number = jid.replace("@s.whatsapp.net", "");
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        null;
-      if (!text) continue;
-
-      if (!grouped[number]) grouped[number] = [];
-      grouped[number].push({
-        direction: msg.key.fromMe ? "outgoing" : "incoming",
-        text,
-        timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000),
+  let lastError = "unknown error";
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-webhook-secret": WEBHOOK_SECRET,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8000),
       });
+      const body = await response.text();
+      if (response.ok) {
+        console.log(`Webhook delivered: ${payload.type} session=${payload.sessionId} status=${response.status}`);
+        return true;
+      }
+      lastError = `HTTP ${response.status}: ${body.slice(0, 500)}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
     }
+    if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+  }
+  console.error(`Webhook failed: ${payload.type} session=${payload.sessionId}: ${lastError}`);
+  return false;
+}
 
-    for (const [number, msgs] of Object.entries(grouped)) {
-      sendToInbox({
+function pushMessage(sessionId, raw, type) {
+  if (raw?.key?.fromMe) return;
+  const jid = cleanJid(raw?.key?.remoteJid);
+  if (!jid || !raw?.message) return;
+  const text = messageText(raw.message);
+  if (!text) return;
+
+  void postWebhook({
+    sessionId,
+    type,
+    conversation: {
+      contactNumber: jid.split("@")[0],
+      contactName: raw.pushName || contactNames.get(`${sessionId}:${jid}`) || null,
+    },
+    message: {
+      id: raw.key.id || undefined,
+      direction: raw.key.fromMe ? "outgoing" : "incoming",
+      text,
+      timestamp: unixSeconds(raw.messageTimestamp),
+    },
+  });
+}
+
+function pushHistory(sessionId, messages) {
+  const grouped = new Map();
+  for (const raw of messages || []) {
+    const jid = cleanJid(raw?.key?.remoteJid);
+    if (!jid || !raw?.message) continue;
+    const text = messageText(raw.message);
+    if (!text) continue;
+    const list = grouped.get(jid) || [];
+    list.push({
+      id: raw.key.id || undefined,
+      direction: raw.key.fromMe ? "outgoing" : "incoming",
+      text,
+      timestamp: unixSeconds(raw.messageTimestamp),
+    });
+    grouped.set(jid, list);
+  }
+
+  for (const [jid, messagesForContact] of grouped) {
+    for (let start = 0; start < messagesForContact.length; start += 500) {
+      void postWebhook({
         sessionId,
         type: "history_sync",
-        conversation: { contactNumber: number, contactName: null },
-        messages: msgs,
+        conversation: {
+          contactNumber: jid.split("@")[0],
+          contactName: contactNames.get(`${sessionId}:${jid}`) || null,
+        },
+        messages: messagesForContact.slice(start, start + 500),
       });
     }
-  });
+  }
 }
 
-// ---- Routes ----
+async function startSession(sessionId) {
+  const existing = sessions.get(sessionId);
+  if (existing?.starting || existing?.status === "connected" || existing?.status === "qr_ready") return existing;
+
+  const session = existing || { socket: null, qr: null, status: "connecting", starting: true };
+  session.status = "connecting";
+  session.starting = true;
+  sessions.set(sessionId, session);
+
+  const authPath = path.join(AUTH_ROOT, sessionId);
+  fs.mkdirSync(authPath, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+  const socket = makeWASocket({ auth: state, logger: pino({ level: "silent" }), syncFullHistory: true });
+  session.socket = socket;
+  session.starting = false;
+
+  socket.ev.on("creds.update", saveCreds);
+  socket.ev.on("contacts.upsert", (contacts) => {
+    for (const contact of contacts || []) {
+      const jid = cleanJid(contact.id);
+      if (jid) contactNames.set(`${sessionId}:${jid}`, contact.name || contact.notify || contact.verifiedName || null);
+    }
+  });
+  socket.ev.on("messaging-history.set", ({ contacts, messages }) => {
+    for (const contact of contacts || []) {
+      const jid = cleanJid(contact.id);
+      if (jid) contactNames.set(`${sessionId}:${jid}`, contact.name || contact.notify || contact.verifiedName || null);
+    }
+    pushHistory(sessionId, messages);
+  });
+  socket.ev.on("messages.upsert", ({ messages, type }) => {
+    if (type !== "notify") return;
+    for (const message of messages || []) pushMessage(sessionId, message, "incoming_message");
+  });
+  socket.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      session.qr = qr;
+      session.status = "qr_ready";
+    }
+    if (connection === "open") {
+      session.status = "connected";
+      session.qr = null;
+      console.log(`WhatsApp connected: ${sessionId}`);
+    }
+    if (connection === "close") {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      session.status = "disconnected";
+      session.qr = null;
+      session.socket = null;
+      console.log(`WhatsApp disconnected: ${sessionId}; reconnect=${shouldReconnect}`);
+      if (shouldReconnect) setTimeout(() => startSession(sessionId).catch((error) => console.error(`Reconnect failed: ${sessionId}: ${error.message}`)), 1500);
+    }
+  });
+
+  return session;
+}
 
 app.post("/session/start", async (req, res) => {
-  const { sessionId } = req.body;
-  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
-
-  if (!sessions[sessionId] || sessions[sessionId].status === "disconnected") {
-    await startSession(sessionId);
+  const { sessionId } = req.body || {};
+  if (!validSessionId(sessionId)) return res.status(400).json({ error: "A valid sessionId is required" });
+  try {
+    const session = await startSession(sessionId);
+    return res.json({ status: session.status });
+  } catch (error) {
+    console.error(`Session start failed: ${sessionId}: ${error.message}`);
+    return res.status(500).json({ error: "Could not start session" });
   }
-  res.json({ status: sessions[sessionId]?.status || "connecting" });
 });
 
 app.get("/session/qr", async (req, res) => {
   const { sessionId } = req.query;
-  const entry = sessions[sessionId];
-  if (!entry?.qr) {
-    return res.status(404).json({
-      error: "No QR available",
-      status: entry?.status || "disconnected",
-    });
-  }
-  const qrImage = await QRCode.toDataURL(entry.qr);
-  res.json({ qr: qrImage });
+  if (!validSessionId(sessionId)) return res.status(400).json({ error: "A valid sessionId is required" });
+  const session = sessions.get(sessionId);
+  if (!session?.qr) return res.status(404).json({ error: "No QR available", status: session?.status || "disconnected" });
+  return res.json({ qr: await QRCode.toDataURL(session.qr) });
 });
 
 app.get("/session/status", (req, res) => {
   const { sessionId } = req.query;
-  const entry = sessions[sessionId];
-  res.json({ status: entry?.status || "disconnected" });
+  if (!validSessionId(sessionId)) return res.status(400).json({ error: "A valid sessionId is required" });
+  return res.json({ status: sessions.get(sessionId)?.status || "disconnected" });
 });
 
-// ---- Send a message (also forwards it to the inbox as an outgoing message) ----
 app.post("/send", async (req, res) => {
-  const { sessionId, number, message } = req.body;
-  const entry = sessions[sessionId];
-  if (!entry || entry.status !== "connected") {
-    return res.status(400).json({ error: "Session not connected" });
-  }
+  const { sessionId, number, message } = req.body || {};
+  if (!validSessionId(sessionId)) return res.status(400).json({ error: "A valid sessionId is required" });
+  const session = sessions.get(sessionId);
+  if (session?.status !== "connected" || !session.socket) return res.status(400).json({ error: "Not connected" });
+  const digits = String(number || "").replace(/\D/g, "");
+  if (digits.length < 8 || typeof message !== "string" || !message.trim()) return res.status(400).json({ error: "A valid number and message are required" });
   try {
-    const jid = number.includes("@s.whatsapp.net")
-      ? number
-      : `${number}@s.whatsapp.net`;
-
-    await entry.sock.sendMessage(jid, { text: message });
-
-    // Forward this outgoing message to the inbox so it shows in the thread
-    sendToInbox({
-      sessionId,
-      type: "incoming_message", // reuse the same handler; direction marks it outgoing
-      conversation: {
-        contactNumber: number.replace("@s.whatsapp.net", ""),
-        contactName: null,
-      },
-      message: {
-        direction: "outgoing",
-        text: message,
-        timestamp: Math.floor(Date.now() / 1000),
-      },
-    });
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    const result = await session.socket.sendMessage(`${digits}@s.whatsapp.net`, { text: message });
+    return res.json({ success: true, messageId: result?.key?.id || null });
+  } catch (error) {
+    console.error(`Send failed: ${sessionId}: ${error.message}`);
+    return res.status(500).json({ error: error.message });
   }
 });
+
+app.get("/health", (_req, res) => res.json({ ok: true, sessions: sessions.size }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Running on port ${PORT}; webhook=${WEBHOOK_URL}`));
