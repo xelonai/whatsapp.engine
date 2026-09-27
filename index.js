@@ -1,5 +1,4 @@
 const express = require("express");
-const cors = require("cors");
 const QRCode = require("qrcode");
 const pino = require("pino");
 const path = require("path");
@@ -11,7 +10,6 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "https://broadwave.cloud/api/public/inbound";
@@ -22,6 +20,15 @@ const contactNames = new Map();
 
 function validSessionId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(value);
+}
+
+// WhatsApp now often addresses chats by a hidden id ("...@lid"); the real number
+// is carried in remoteJidAlt / senderPn. Prefer the real phone number.
+function keyJid(key) {
+  if (!key) return null;
+  const candidates = [key.remoteJid, key.remoteJidAlt, key.senderPn, key.participantAlt];
+  for (const c of candidates) { const j = cleanJid(c); if (j) return j; }
+  return null;
 }
 
 function cleanJid(jid) {
@@ -68,7 +75,7 @@ async function postWebhook(payload) {
           "x-webhook-secret": WEBHOOK_SECRET,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(30000),
       });
       const body = await response.text();
       if (response.ok) {
@@ -87,7 +94,7 @@ async function postWebhook(payload) {
 
 function pushMessage(sessionId, raw, type) {
   if (raw?.key?.fromMe) return;
-  const jid = cleanJid(raw?.key?.remoteJid);
+  const jid = keyJid(raw?.key);
   if (!jid || !raw?.message) return;
   const text = messageText(raw.message);
   if (!text) return;
@@ -108,10 +115,11 @@ function pushMessage(sessionId, raw, type) {
   });
 }
 
+let historyQueue = Promise.resolve();
 function pushHistory(sessionId, messages) {
   const grouped = new Map();
   for (const raw of messages || []) {
-    const jid = cleanJid(raw?.key?.remoteJid);
+    const jid = keyJid(raw?.key);
     if (!jid || !raw?.message) continue;
     const text = messageText(raw.message);
     if (!text) continue;
@@ -125,19 +133,21 @@ function pushHistory(sessionId, messages) {
     grouped.set(jid, list);
   }
 
+  historyQueue = historyQueue.then(async () => {
   for (const [jid, messagesForContact] of grouped) {
-    for (let start = 0; start < messagesForContact.length; start += 500) {
-      void postWebhook({
+    for (let start = 0; start < messagesForContact.length; start += 200) {
+      await postWebhook({
         sessionId,
         type: "history_sync",
         conversation: {
           contactNumber: jid.split("@")[0],
           contactName: contactNames.get(`${sessionId}:${jid}`) || null,
         },
-        messages: messagesForContact.slice(start, start + 500),
+        messages: messagesForContact.slice(start, start + 200),
       });
     }
   }
+  }).catch((e) => console.error("History push error:", e?.message));
 }
 
 async function startSession(sessionId) {
@@ -159,20 +169,22 @@ async function startSession(sessionId) {
   socket.ev.on("creds.update", saveCreds);
   socket.ev.on("contacts.upsert", (contacts) => {
     for (const contact of contacts || []) {
-      const jid = cleanJid(contact.id);
+      const jid = cleanJid(contact.id) || cleanJid(contact.phoneNumber) || cleanJid(contact.jid);
       if (jid) contactNames.set(`${sessionId}:${jid}`, contact.name || contact.notify || contact.verifiedName || null);
     }
   });
   socket.ev.on("messaging-history.set", ({ contacts, messages }) => {
     for (const contact of contacts || []) {
-      const jid = cleanJid(contact.id);
+      const jid = cleanJid(contact.id) || cleanJid(contact.phoneNumber) || cleanJid(contact.jid);
       if (jid) contactNames.set(`${sessionId}:${jid}`, contact.name || contact.notify || contact.verifiedName || null);
     }
     pushHistory(sessionId, messages);
   });
   socket.ev.on("messages.upsert", ({ messages, type }) => {
-    if (type !== "notify") return;
-    for (const message of messages || []) pushMessage(sessionId, message, "incoming_message");
+    for (const message of messages || []) {
+      console.log(`Message event (${type}) session=${sessionId} jid=${message?.key?.remoteJid}`);
+      pushMessage(sessionId, message, type === "notify" ? "incoming_message" : "history_sync");
+    }
   });
   socket.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
     if (qr) {
